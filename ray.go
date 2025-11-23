@@ -45,7 +45,7 @@ const (
 	ModeDomainScan
 )
 
-// MultiFlag allows repeated flags (e.g. -H "A: B" -H "C: D")
+// MultiFlag allows repeated flags
 type MultiFlag []string
 
 func (m *MultiFlag) String() string {
@@ -65,6 +65,7 @@ type Config struct {
 	DomainScan    string
 	Method        string
 	Headers       MultiFlag 
+	Extensions    string // New: Extensions support
 	Data          string
 	Timeout       int
 	Concurrency   int
@@ -83,6 +84,7 @@ type Config struct {
 	SaveJson      string
 	FuzzMode      FuzzMode
 	Verbose       bool
+	ParsedExts    []string // Helper for extensions
 }
 
 // Result represents a fuzzing result
@@ -98,6 +100,7 @@ type Result struct {
 	Title       string    `json:"title"`
 	Timestamp   time.Time `json:"timestamp"`
 	Anomaly     bool      `json:"anomaly"`
+	Redirect    string    `json:"redirect_location"` // New: Track redirects
 	Error       error     `json:"-"`
 }
 
@@ -128,7 +131,7 @@ var (
 )
 
 func main() {
-	// 1. Setup Context and Signal Handling
+	// 1. Setup Context
 	ctx, cancel := context.WithCancel(context.Background())
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -139,27 +142,33 @@ func main() {
 		cancel()
 	}()
 
-	// 2. Initialization
+	// 2. Init
 	printBanner()
 	parseFlags()
-	validateConfig()
+	validateConfig() // Logic to act like Dirsearch is here
 
 	stats.StartTime = time.Now()
 	stats.StatusCodes = make(map[int]int)
 
-	// 3. Load Resources
+	// 3. Load Wordlist
 	words, err := loadWordlist(config.Wordlist)
 	if err != nil && config.FuzzMode != ModeDomainScan {
 		fatal(fmt.Sprintf("Error loading wordlist: %v", err))
+	}
+
+	// Calculate Total Requests (Words * (1 base + N extensions))
+	multiplier := 1
+	if len(config.ParsedExts) > 0 {
+		multiplier = 1 + len(config.ParsedExts)
 	}
 
 	var targets []string
 	switch config.FuzzMode {
 	case ModeSingleURL:
 		targets = []string{config.URL}
-		stats.Total = int64(len(words))
+		stats.Total = int64(len(words) * multiplier)
 		if !config.Silent {
-			fmt.Printf("%s[+] Mode: Single URL Fuzzing%s\n", ColorGreen, ColorReset)
+			fmt.Printf("%s[+] Mode: Directory Fuzzing (Dirsearch Style)%s\n", ColorGreen, ColorReset)
 		}
 	case ModeDomainList:
 		domains, err := loadDomainList(config.DomainList)
@@ -167,9 +176,9 @@ func main() {
 			fatal(fmt.Sprintf("Error loading domain list: %v", err))
 		}
 		targets = domains
-		stats.Total = int64(len(words) * len(domains))
+		stats.Total = int64(len(words) * len(domains) * multiplier)
 		if !config.Silent {
-			fmt.Printf("%s[+] Mode: Domain List Fuzzing (%d domains)%s\n", ColorGreen, len(domains), ColorReset)
+			fmt.Printf("%s[+] Mode: Mass Domain Fuzzing (%d domains)%s\n", ColorGreen, len(domains), ColorReset)
 		}
 	case ModeDomainScan:
 		domains, err := loadDomainList(config.DomainScan)
@@ -187,14 +196,14 @@ func main() {
 		printConfig(len(words), len(targets))
 	}
 
-	// 4. HTTP Client & Regex
 	client := createOptimizedClient()
 
-	// Calibration
+	// Auto-Calibrate (Baseline check)
 	if config.AutoCalibrate && config.FuzzMode == ModeSingleURL {
 		calibrateBaseline(ctx, client)
 	}
 
+	// Regex setup
 	var matchRe, filterRe *regexp.Regexp
 	if config.MatchRegex != "" {
 		matchRe = regexp.MustCompile(config.MatchRegex)
@@ -203,7 +212,7 @@ func main() {
 		filterRe = regexp.MustCompile(config.FilterRegex)
 	}
 
-	// 5. Pipelines
+	// Pipelines
 	jobs := make(chan Job, config.Concurrency)
 	jobResults := make(chan Result, config.Concurrency)
 
@@ -215,54 +224,62 @@ func main() {
 		rateLimiter = ticker.C
 	}
 
-	// 6. Start Workers
+	// Start Workers
 	var wg sync.WaitGroup
 	for i := 0; i < config.Concurrency; i++ {
 		wg.Add(1)
 		go worker(ctx, &wg, jobs, jobResults, client, matchRe, filterRe, rateLimiter)
 	}
 
-	// 7. Start Collector & Stats Printer
+	// Start Collector
 	var collectWg sync.WaitGroup
 	collectWg.Add(1)
 	go resultCollector(&collectWg, jobResults)
 
+	// Start Stats
 	var statsWg sync.WaitGroup
 	statsWg.Add(1)
 	go statsPrinter(ctx, &statsWg)
 
-	// 8. Dispatch Jobs
+	// Dispatch Jobs
 	go func() {
 		defer close(jobs)
 		
 		if config.FuzzMode == ModeDomainScan {
 			for _, target := range targets {
 				select {
-				case <-ctx.Done():
-					return
+				case <-ctx.Done(): return
 				case jobs <- Job{URL: target, Word: ""}:
 				}
 			}
 			return
 		}
 
-		// Fuzzing Modes
+		// Fuzzing Loop (Handles Extensions)
 		for _, target := range targets {
 			for _, word := range words {
+				// 1. Send the base word
 				select {
-				case <-ctx.Done():
-					return
+				case <-ctx.Done(): return
 				case jobs <- Job{URL: target, Word: word}:
+				}
+
+				// 2. Send extensions (e.g., word.php, word.html)
+				for _, ext := range config.ParsedExts {
+					fullWord := word + "." + ext
+					select {
+					case <-ctx.Done(): return
+					case jobs <- Job{URL: target, Word: fullWord}:
+					}
 				}
 			}
 		}
 	}()
 
-	// 9. Wait and Cleanup
-	wg.Wait()        
-	close(jobResults) 
-	collectWg.Wait() 
-	statsWg.Wait()   
+	wg.Wait()
+	close(jobResults)
+	collectWg.Wait()
+	statsWg.Wait()
 
 	if !config.Silent {
 		printFinalStats()
@@ -305,6 +322,7 @@ func createOptimizedClient() *http.Client {
 	return &http.Client{
 		Timeout:   time.Duration(config.Timeout) * time.Second,
 		Transport: transport,
+		// We do NOT follow redirects automatically to allow 301/302 detection
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse 
 		},
@@ -420,6 +438,12 @@ func fuzz(ctx context.Context, client *http.Client, targetURL, word string) Resu
 	length := len(bodyBytes)
 	bodyString := string(bodyBytes)
 	
+	// Check for redirect
+	redirectLoc := ""
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		redirectLoc = resp.Header.Get("Location")
+	}
+
 	return Result{
 		URL:         finalURL,
 		StatusCode:  resp.StatusCode,
@@ -432,6 +456,7 @@ func fuzz(ctx context.Context, client *http.Client, targetURL, word string) Resu
 		Title:       extractTitle(bodyString),
 		Timestamp:   time.Now(),
 		Anomaly:     detectAnomaly(length),
+		Redirect:    redirectLoc,
 	}
 }
 
@@ -563,22 +588,24 @@ func printResult(result Result) {
 	}
 
 	if config.Colors {
-		fmt.Printf("[%s%3d%s] [%sLen: %8d%s] [%sL: %4d%s] [%sW: %6d%s] [%s%.3fs%s]%s %s%-40s%s",
+		// Print basic stats
+		fmt.Printf("[%s%3d%s] [%sLen: %8d%s] [%s%.3fs%s]%s %s%-35s%s",
 			statusColor, result.StatusCode, ColorReset,
 			ColorCyan, result.Length, ColorReset,
-			ColorBlue, result.Lines, ColorReset,
-			ColorBlue, result.Words, ColorReset,
 			ColorYellow, result.Time, ColorReset,
 			anomalyMarker,
-			ColorGreen+ColorBold, truncate(result.Word, 40), ColorReset)
+			ColorGreen+ColorBold, truncate(result.Word, 35), ColorReset)
 
-		if result.Title != "" {
-			fmt.Printf(" | %s%s%s", ColorPurple, truncate(result.Title, 30), ColorReset)
+		// Print Redirect
+		if result.Redirect != "" {
+			fmt.Printf(" -> %s%s%s", ColorBlue, truncate(result.Redirect, 30), ColorReset)
+		} else if result.Title != "" {
+			fmt.Printf(" | %s%s%s", ColorPurple, truncate(result.Title, 25), ColorReset)
 		}
 		fmt.Println()
 	} else {
-		fmt.Printf("[%d] [Len: %d] [L: %d] [W: %d] [%.3fs] %s\n",
-			result.StatusCode, result.Length, result.Lines, result.Words, result.Time, result.URL)
+		fmt.Printf("[%d] [Len: %d] [%.3fs] %s\n",
+			result.StatusCode, result.Length, result.Time, result.URL)
 	}
 }
 
@@ -659,7 +686,6 @@ func printFinalStats() {
 	fmt.Println()
 }
 
-// printBanner displays the tool banner with your custom ASCII art
 func printBanner() {
 	banner := `
 ██████╗  █████╗ ██╗   ██╗
@@ -675,36 +701,41 @@ func printBanner() {
 		fmt.Printf("%s  Developed by Biswajeet Ray%s\n\n", ColorDim, ColorReset)
 	} else {
 		fmt.Println(banner)
-		fmt.Println("  High-Performance Security Scanner")
-		fmt.Println("  Developed by Biswajeet Ray\n")
 	}
 }
 
 func printConfig(wordCount, targetCount int) {
 	fmt.Printf("%s[Config]%s\n", ColorBold+ColorYellow, ColorReset)
 	fmt.Printf("  Targets: %d | Words: %d | Threads: %d\n", targetCount, wordCount, config.Concurrency)
+	if len(config.ParsedExts) > 0 {
+		fmt.Printf("  Exts   : %s\n", strings.Join(config.ParsedExts, ", "))
+	}
 	fmt.Printf("  Method : %s | Timeout: %ds\n", config.Method, config.Timeout)
 	fmt.Printf("\n%s[Starting]%s\n\n", ColorBold+ColorGreen, ColorReset)
 }
 
 func parseFlags() {
-	flag.StringVar(&config.URL, "u", "", "Target URL with FUZZ placeholder")
+	flag.StringVar(&config.URL, "u", "", "Target URL")
 	flag.StringVar(&config.Wordlist, "w", "", "Wordlist file")
 	flag.StringVar(&config.DomainList, "L", "", "List of domains to fuzz")
 	flag.StringVar(&config.DomainScan, "scan", "", "List of domains to check alive")
 	flag.StringVar(&config.Method, "X", "GET", "HTTP method")
 	flag.StringVar(&config.Data, "d", "", "POST data")
+	flag.StringVar(&config.Extensions, "e", "", "Extensions (e.g., php,html,txt)")
+	
 	flag.IntVar(&config.Timeout, "timeout", 10, "Timeout in seconds")
 	flag.IntVar(&config.Concurrency, "c", 50, "Concurrency level")
 	flag.IntVar(&config.Rate, "rate", 0, "Rate limit (req/s)")
 	flag.IntVar(&config.Delay, "delay", 0, "Delay per request (ms)")
+	
 	flag.BoolVar(&config.Silent, "silent", false, "Silent mode")
 	flag.BoolVar(&config.Colors, "colors", true, "Colorized output")
 	flag.BoolVar(&config.AutoCalibrate, "calibrate", false, "Auto-calibrate baseline")
+	
 	flag.StringVar(&config.Output, "o", "", "Output file (txt)")
 	flag.StringVar(&config.SaveJson, "json", "", "Save as JSON")
 
-	flag.Var(&config.Headers, "H", "Custom headers (e.g. -H 'Cookie: 1' -H 'Auth: 2')")
+	flag.Var(&config.Headers, "H", "Custom headers")
 
 	var mc, fc, ml, fl string
 	flag.StringVar(&mc, "mc", "", "Match status codes (comma-separated)")
@@ -721,6 +752,13 @@ func parseFlags() {
 	if ml != "" { config.MatchLen = parseIntList(ml) }
 	if fl != "" { config.FilterLen = parseIntList(fl) }
 
+	if config.Extensions != "" {
+		parts := strings.Split(config.Extensions, ",")
+		for _, p := range parts {
+			config.ParsedExts = append(config.ParsedExts, strings.TrimPrefix(strings.TrimSpace(p), "."))
+		}
+	}
+
 	if config.URL != "" { config.FuzzMode = ModeSingleURL }
 	if config.DomainList != "" { config.FuzzMode = ModeDomainList }
 	if config.DomainScan != "" { config.FuzzMode = ModeDomainScan }
@@ -733,8 +771,24 @@ func validateConfig() {
 	if config.Wordlist == "" && config.FuzzMode != ModeDomainScan {
 		fatal("Wordlist (-w) is required")
 	}
+
+	// --- DIRSEARCH STYLE LOGIC ---
+	// If URL doesn't have "FUZZ" and it's a single URL mode
 	if config.URL != "" && !strings.Contains(config.URL, "FUZZ") && !strings.Contains(config.Data, "FUZZ") {
-		fatal("URL or Data must contain 'FUZZ'")
+		// 1. Add protocol if missing
+		if !strings.HasPrefix(config.URL, "http") {
+			config.URL = "https://" + config.URL
+		}
+		// 2. Ensure trailing slash
+		if !strings.HasSuffix(config.URL, "/") {
+			config.URL += "/"
+		}
+		// 3. Append FUZZ automatically
+		config.URL += "FUZZ"
+		
+		if !config.Silent {
+			fmt.Printf("%s[!] Auto-appending 'FUZZ' -> %s%s\n", ColorYellow, config.URL, ColorReset)
+		}
 	}
 }
 
