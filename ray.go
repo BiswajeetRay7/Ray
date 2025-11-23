@@ -10,7 +10,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"regexp"
@@ -34,8 +33,6 @@ const (
 	ColorCyan    = "\033[36m"
 	ColorWhite   = "\033[37m"
 	ColorBold    = "\033[1m"
-	ColorBgGreen = "\033[42m"
-	ColorBgRed   = "\033[41m"
 	ColorDim     = "\033[2m"
 )
 
@@ -48,6 +45,18 @@ const (
 	ModeDomainScan
 )
 
+// MultiFlag allows repeated flags (e.g. -H "A: B" -H "C: D")
+type MultiFlag []string
+
+func (m *MultiFlag) String() string {
+	return strings.Join(*m, ", ")
+}
+
+func (m *MultiFlag) Set(value string) error {
+	*m = append(*m, value)
+	return nil
+}
+
 // Config holds all configuration
 type Config struct {
 	URL           string
@@ -55,7 +64,7 @@ type Config struct {
 	DomainList    string
 	DomainScan    string
 	Method        string
-	Headers       map[string]string
+	Headers       MultiFlag 
 	Data          string
 	Timeout       int
 	Concurrency   int
@@ -74,7 +83,6 @@ type Config struct {
 	SaveJson      string
 	FuzzMode      FuzzMode
 	Verbose       bool
-	MaxRetries    int
 }
 
 // Result represents a fuzzing result
@@ -86,73 +94,70 @@ type Result struct {
 	Time        float64   `json:"time"`
 	Lines       int       `json:"lines"`
 	Words       int       `json:"words"`
-	Hash        string    `json:"hash"`
 	ContentType string    `json:"content_type"`
 	Title       string    `json:"title"`
 	Timestamp   time.Time `json:"timestamp"`
 	Anomaly     bool      `json:"anomaly"`
-}
-
-// StatusSummary tracks results by status code
-type StatusSummary struct {
-	Code    int
-	Count   int
-	Samples []string
+	Error       error     `json:"-"`
 }
 
 // Stats tracks real-time statistics
 type Stats struct {
-	Total       int64
-	Requests    int64
-	Matches     int64
-	Errors      int64
-	StartTime   time.Time
-	LastPrint   time.Time
-	BaselineLen int
+	Total        int64
+	Requests     int64
+	Matches      int64
+	Errors       int64
+	StartTime    time.Time
+	BaselineLen  int
 	BaselineCode int
-	StatusCodes map[int]int
-	Lock        sync.RWMutex
+	StatusCodes  map[int]int
+	Lock         sync.RWMutex
 }
 
 type AnomalyDetector struct {
 	BaselineLen  int
-	BaselineCode int
 	LenThreshold float64
-	CodeDiff     bool
 }
 
 var (
-	config           Config
-	stats            Stats
-	anomalyDetector  AnomalyDetector
-	results          []Result
-	resultsLock      sync.Mutex
-	sigChan          = make(chan os.Signal, 1)
+	config          Config
+	stats           Stats
+	anomalyDetector AnomalyDetector
+	results         []Result
+	resultsLock     sync.Mutex
 )
 
 func main() {
+	// 1. Setup Context and Signal Handling
+	ctx, cancel := context.WithCancel(context.Background())
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		fmt.Printf("\n%s[!] Shutting down gracefully...%s\n", ColorRed, ColorReset)
+		cancel()
+	}()
+
+	// 2. Initialization
 	printBanner()
 	parseFlags()
 	validateConfig()
 
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
 	stats.StartTime = time.Now()
-	stats.LastPrint = time.Now()
 	stats.StatusCodes = make(map[int]int)
 
-	// Load wordlist
+	// 3. Load Resources
 	words, err := loadWordlist(config.Wordlist)
-	if err != nil {
+	if err != nil && config.FuzzMode != ModeDomainScan {
 		fatal(fmt.Sprintf("Error loading wordlist: %v", err))
 	}
-	stats.Total = int64(len(words))
 
-	// Determine fuzz mode and load targets
 	var targets []string
 	switch config.FuzzMode {
 	case ModeSingleURL:
 		targets = []string{config.URL}
+		stats.Total = int64(len(words))
 		if !config.Silent {
 			fmt.Printf("%s[+] Mode: Single URL Fuzzing%s\n", ColorGreen, ColorReset)
 		}
@@ -172,26 +177,24 @@ func main() {
 			fatal(fmt.Sprintf("Error loading domain scan list: %v", err))
 		}
 		targets = domains
-		// For domain scan, we're just checking the domains themselves
-		if !config.Silent {
-			fmt.Printf("%s[+] Mode: Domain Enumeration Scan (%d domains)%s\n", ColorGreen, len(domains), ColorReset)
-		}
 		stats.Total = int64(len(domains))
+		if !config.Silent {
+			fmt.Printf("%s[+] Mode: Domain Enumeration (%d domains)%s\n", ColorGreen, len(domains), ColorReset)
+		}
 	}
 
 	if !config.Silent {
-		printConfig(words, targets)
+		printConfig(len(words), len(targets))
 	}
 
-	// Create optimized HTTP client
+	// 4. HTTP Client & Regex
 	client := createOptimizedClient()
 
-	// Auto-calibrate baseline
+	// Calibration
 	if config.AutoCalibrate && config.FuzzMode == ModeSingleURL {
-		calibrateBaseline(client)
+		calibrateBaseline(ctx, client)
 	}
 
-	// Compile regex patterns
 	var matchRe, filterRe *regexp.Regexp
 	if config.MatchRegex != "" {
 		matchRe = regexp.MustCompile(config.MatchRegex)
@@ -200,15 +203,11 @@ func main() {
 		filterRe = regexp.MustCompile(config.FilterRegex)
 	}
 
-	// Create context
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// 5. Pipelines
+	jobs := make(chan Job, config.Concurrency)
+	jobResults := make(chan Result, config.Concurrency)
 
-	// Setup channels
-	jobs := make(chan Job, config.Concurrency*3)
-	jobResults := make(chan Result, config.Concurrency*2)
-
-	// Rate limiter
+	// Rate Limiter
 	var rateLimiter <-chan time.Time
 	if config.Rate > 0 {
 		ticker := time.NewTicker(time.Second / time.Duration(config.Rate))
@@ -216,77 +215,59 @@ func main() {
 		rateLimiter = ticker.C
 	}
 
-	// Start workers
+	// 6. Start Workers
 	var wg sync.WaitGroup
 	for i := 0; i < config.Concurrency; i++ {
 		wg.Add(1)
 		go worker(ctx, &wg, jobs, jobResults, client, matchRe, filterRe, rateLimiter)
 	}
 
-	// Results collector
+	// 7. Start Collector & Stats Printer
 	var collectWg sync.WaitGroup
 	collectWg.Add(1)
-	go resultCollector(ctx, &collectWg, jobResults)
+	go resultCollector(&collectWg, jobResults)
 
-	// Live stats printer
 	var statsWg sync.WaitGroup
 	statsWg.Add(1)
 	go statsPrinter(ctx, &statsWg)
 
-	// Job dispatcher
+	// 8. Dispatch Jobs
 	go func() {
 		defer close(jobs)
-		switch config.FuzzMode {
-		case ModeSingleURL:
-			for _, word := range words {
-				select {
-				case <-sigChan:
-					return
-				case jobs <- Job{URL: config.URL, Word: word}:
-				}
-			}
-		case ModeDomainList:
-			for _, target := range targets {
-				for _, word := range words {
-					select {
-					case <-sigChan:
-						return
-					case jobs <- Job{URL: target, Word: word}:
-					}
-				}
-			}
-		case ModeDomainScan:
+		
+		if config.FuzzMode == ModeDomainScan {
 			for _, target := range targets {
 				select {
-				case <-sigChan:
+				case <-ctx.Done():
 					return
 				case jobs <- Job{URL: target, Word: ""}:
 				}
 			}
+			return
+		}
+
+		// Fuzzing Modes
+		for _, target := range targets {
+			for _, word := range words {
+				select {
+				case <-ctx.Done():
+					return
+				case jobs <- Job{URL: target, Word: word}:
+				}
+			}
 		}
 	}()
 
-	// Graceful shutdown handler
-	go func() {
-		<-sigChan
-		if !config.Silent {
-			fmt.Printf("\n%s[!] Graceful shutdown initiated...%s\n", ColorYellow, ColorReset)
-		}
-		cancel()
-	}()
+	// 9. Wait and Cleanup
+	wg.Wait()        
+	close(jobResults) 
+	collectWg.Wait() 
+	statsWg.Wait()   
 
-	// Wait for completion
-	wg.Wait()
-	close(jobResults)
-	collectWg.Wait()
-	statsWg.Wait()
-
-	// Final output
 	if !config.Silent {
 		printFinalStats()
 	}
 
-	// Save results
 	if config.SaveJson != "" {
 		saveResults()
 	}
@@ -301,48 +282,47 @@ type Job struct {
 	Word string
 }
 
-// createOptimizedClient creates a highly optimized HTTP client
 func createOptimizedClient() *http.Client {
 	dialer := &net.Dialer{
 		Timeout:   time.Duration(config.Timeout) * time.Second,
 		KeepAlive: 30 * time.Second,
-		DualStack: true,
 	}
 
 	transport := &http.Transport{
-		Dial:                  dialer.Dial,
 		DialContext:           dialer.DialContext,
-		MaxIdleConns:          config.Concurrency * 2,
-		MaxIdleConnsPerHost:   config.Concurrency,
-		MaxConnsPerHost:       config.Concurrency,
+		MaxIdleConns:          config.Concurrency,
+		MaxIdleConnsPerHost:   config.Concurrency, 
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: time.Duration(config.Timeout) * time.Second,
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true,
-			MinVersion:        tls.VersionTLS12,
+			MinVersion:         tls.VersionTLS12,
 		},
-		DisableKeepAlives:     false,
-		DisableCompression:    false,
-		ResponseHeaderTimeout: time.Duration(config.Timeout) * time.Second,
+		DisableKeepAlives: false,
 	}
 
 	return &http.Client{
 		Timeout:   time.Duration(config.Timeout) * time.Second,
 		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse 
+		},
 	}
 }
 
-// calibrateBaseline detects baseline response
-func calibrateBaseline(client *http.Client) {
+func calibrateBaseline(ctx context.Context, client *http.Client) {
 	if !config.Silent {
 		fmt.Printf("%s[*] Calibrating baseline...%s\n", ColorYellow, ColorReset)
 	}
 
-	testWord := "BASELINEXYZ" + strconv.FormatInt(time.Now().Unix(), 10)
+	// Use a random string that is unlikely to exist
+	testWord := "R4ND0M" + strconv.FormatInt(time.Now().Unix(), 10)
 	testURL := strings.ReplaceAll(config.URL, "FUZZ", testWord)
 
-	req, _ := http.NewRequest("GET", testURL, nil)
+	req, _ := http.NewRequestWithContext(ctx, config.Method, testURL, nil)
+	addHeaders(req)
+	
 	resp, err := client.Do(req)
 	if err == nil {
 		defer resp.Body.Close()
@@ -350,8 +330,7 @@ func calibrateBaseline(client *http.Client) {
 		stats.BaselineLen = len(body)
 		stats.BaselineCode = resp.StatusCode
 		anomalyDetector.BaselineLen = stats.BaselineLen
-		anomalyDetector.BaselineCode = stats.BaselineCode
-		anomalyDetector.LenThreshold = float64(stats.BaselineLen) * 0.15
+		anomalyDetector.LenThreshold = float64(stats.BaselineLen) * 0.15 
 
 		if !config.Silent {
 			fmt.Printf("%s[+] Baseline: %d bytes, Status %d%s\n", ColorGreen, stats.BaselineLen, stats.BaselineCode, ColorReset)
@@ -359,8 +338,7 @@ func calibrateBaseline(client *http.Client) {
 	}
 }
 
-// worker processes jobs
-func worker(ctx context.Context, wg *sync.WaitGroup, jobs <-chan Job, results chan<- Result, 
+func worker(ctx context.Context, wg *sync.WaitGroup, jobs <-chan Job, results chan<- Result,
 	client *http.Client, matchRe, filterRe *regexp.Regexp, rateLimiter <-chan time.Time) {
 	defer wg.Done()
 
@@ -369,21 +347,30 @@ func worker(ctx context.Context, wg *sync.WaitGroup, jobs <-chan Job, results ch
 		case <-ctx.Done():
 			return
 		default:
-			if rateLimiter != nil {
-				<-rateLimiter
-			}
-			if config.Delay > 0 {
-				time.Sleep(time.Millisecond * time.Duration(config.Delay))
-			}
+		}
 
-			var result Result
-			if config.FuzzMode == ModeDomainScan {
-				result = domainScan(client, job.URL)
-			} else {
-				result = fuzz(client, job.URL, job.Word)
+		if rateLimiter != nil {
+			select {
+			case <-rateLimiter:
+			case <-ctx.Done():
+				return
 			}
+		}
+		
+		if config.Delay > 0 {
+			time.Sleep(time.Millisecond * time.Duration(config.Delay))
+		}
 
-			atomic.AddInt64(&stats.Requests, 1)
+		var result Result
+		if config.FuzzMode == ModeDomainScan {
+			result = domainScan(ctx, client, job.URL)
+		} else {
+			result = fuzz(ctx, client, job.URL, job.Word)
+		}
+
+		atomic.AddInt64(&stats.Requests, 1)
+		
+		if result.Error == nil {
 			stats.Lock.Lock()
 			stats.StatusCodes[result.StatusCode]++
 			stats.Lock.Unlock()
@@ -392,124 +379,120 @@ func worker(ctx context.Context, wg *sync.WaitGroup, jobs <-chan Job, results ch
 				atomic.AddInt64(&stats.Matches, 1)
 				results <- result
 			}
+		} else {
+			atomic.AddInt64(&stats.Errors, 1)
 		}
 	}
 }
 
-// fuzz performs a fuzzing request
-func fuzz(client *http.Client, targetURL, word string) Result {
+func fuzz(ctx context.Context, client *http.Client, targetURL, word string) Result {
 	start := time.Now()
 
-	encodedWord := url.PathEscape(word)
-	targetURL = strings.ReplaceAll(targetURL, "FUZZ", encodedWord)
-	body := strings.ReplaceAll(config.Data, "FUZZ", word)
+	finalURL := strings.ReplaceAll(targetURL, "FUZZ", word)
+	bodyStr := strings.ReplaceAll(config.Data, "FUZZ", word)
 
 	var req *http.Request
 	var err error
+	
 	if config.Data != "" {
-		req, err = http.NewRequest(config.Method, targetURL, strings.NewReader(body))
+		req, err = http.NewRequestWithContext(ctx, config.Method, finalURL, strings.NewReader(bodyStr))
 	} else {
-		req, err = http.NewRequest(config.Method, targetURL, nil)
+		req, err = http.NewRequestWithContext(ctx, config.Method, finalURL, nil)
 	}
 
 	if err != nil {
-		atomic.AddInt64(&stats.Errors, 1)
-		return Result{URL: targetURL, StatusCode: 0, Word: word, Time: time.Since(start).Seconds(), Timestamp: time.Now()}
+		return Result{URL: finalURL, Error: err, Timestamp: time.Now()}
 	}
 
-	// Add headers
-	for key, value := range config.Headers {
-		req.Header.Set(key, value)
-	}
-
-	if req.Header.Get("User-Agent") == "" {
-		req.Header.Set("User-Agent", "RAY/1.0 (Security Scanner)")
-	}
+	addHeaders(req)
 
 	resp, err := client.Do(req)
 	if err != nil {
-		atomic.AddInt64(&stats.Errors, 1)
-		return Result{URL: targetURL, StatusCode: 0, Word: word, Time: time.Since(start).Seconds(), Timestamp: time.Now()}
+		return Result{URL: finalURL, Error: err, Timestamp: time.Now()}
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, _ := io.ReadAll(resp.Body)
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return Result{URL: finalURL, Error: err, Timestamp: time.Now()}
+	}
+
 	length := len(bodyBytes)
-	bodyStr := string(bodyBytes)
-	lines := strings.Count(bodyStr, "\n") + 1
-	words := len(strings.Fields(bodyStr))
-
-	// Extract title
-	title := extractTitle(bodyStr)
-
+	bodyString := string(bodyBytes)
+	
 	return Result{
-		URL:         targetURL,
+		URL:         finalURL,
 		StatusCode:  resp.StatusCode,
 		Length:      length,
 		Word:        word,
 		Time:        time.Since(start).Seconds(),
-		Lines:       lines,
-		Words:       words,
+		Lines:       strings.Count(bodyString, "\n") + 1,
+		Words:       len(strings.Fields(bodyString)),
 		ContentType: resp.Header.Get("Content-Type"),
-		Title:       title,
+		Title:       extractTitle(bodyString),
 		Timestamp:   time.Now(),
-		Anomaly:     detectAnomaly(length, resp.StatusCode),
+		Anomaly:     detectAnomaly(length),
 	}
 }
 
-// domainScan checks if a domain is alive
-func domainScan(client *http.Client, domain string) Result {
+func domainScan(ctx context.Context, client *http.Client, domain string) Result {
 	start := time.Now()
-
-	// Ensure domain has scheme
-	if !strings.HasPrefix(domain, "http://") && !strings.HasPrefix(domain, "https://") {
-		domain = "https://" + domain
+	
+	target := domain
+	if !strings.HasPrefix(target, "http") {
+		target = "https://" + domain
 	}
 
-	req, _ := http.NewRequest("GET", domain, nil)
-	req.Header.Set("User-Agent", "RAY/1.0 (Security Scanner)")
+	req, err := http.NewRequestWithContext(ctx, "GET", target, nil)
+	if err != nil {
+		return Result{URL: target, Error: err}
+	}
+	
+	req.Header.Set("User-Agent", "RAY/1.0 (Scanner)")
 
 	resp, err := client.Do(req)
-	if err != nil {
-		// Try HTTP if HTTPS fails
-		if strings.HasPrefix(domain, "https://") {
-			domain = strings.Replace(domain, "https://", "http://", 1)
-			req, _ := http.NewRequest("GET", domain, nil)
-			req.Header.Set("User-Agent", "RAY/1.0 (Security Scanner)")
-			resp, err = client.Do(req)
-			if err != nil {
-				atomic.AddInt64(&stats.Errors, 1)
-				return Result{URL: domain, StatusCode: 0, Time: time.Since(start).Seconds(), Timestamp: time.Now()}
-			}
-		} else {
-			atomic.AddInt64(&stats.Errors, 1)
-			return Result{URL: domain, StatusCode: 0, Time: time.Since(start).Seconds(), Timestamp: time.Now()}
-		}
+	// If HTTPS fails, try HTTP
+	if err != nil && strings.HasPrefix(target, "https://") {
+		target = strings.Replace(target, "https://", "http://", 1)
+		req, _ = http.NewRequestWithContext(ctx, "GET", target, nil)
+		req.Header.Set("User-Agent", "RAY/1.0 (Scanner)")
+		resp, err = client.Do(req)
 	}
 
+	if err != nil {
+		return Result{URL: domain, Error: err}
+	}
 	defer resp.Body.Close()
+
 	bodyBytes, _ := io.ReadAll(resp.Body)
-	length := len(bodyBytes)
-	bodyStr := string(bodyBytes)
-	lines := strings.Count(bodyStr, "\n") + 1
-	words := len(strings.Fields(bodyStr))
-	title := extractTitle(bodyStr)
+	bodyString := string(bodyBytes)
 
 	return Result{
-		URL:         domain,
+		URL:         target,
 		StatusCode:  resp.StatusCode,
-		Length:      length,
+		Length:      len(bodyBytes),
 		Time:        time.Since(start).Seconds(),
-		Lines:       lines,
-		Words:       words,
+		Lines:       strings.Count(bodyString, "\n") + 1,
+		Words:       len(strings.Fields(bodyString)),
 		ContentType: resp.Header.Get("Content-Type"),
-		Title:       title,
+		Title:       extractTitle(bodyString),
 		Timestamp:   time.Now(),
 	}
 }
 
-// detectAnomaly detects anomalous responses
-func detectAnomaly(length, code int) bool {
+func addHeaders(req *http.Request) {
+	for _, h := range config.Headers {
+		parts := strings.SplitN(h, ":", 2)
+		if len(parts) == 2 {
+			req.Header.Add(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
+		}
+	}
+	if req.Header.Get("User-Agent") == "" {
+		req.Header.Set("User-Agent", "RAY/1.0 (Security Scanner)")
+	}
+}
+
+func detectAnomaly(length int) bool {
 	if config.AutoCalibrate && stats.BaselineLen > 0 {
 		diff := float64(length - stats.BaselineLen)
 		if diff < 0 {
@@ -520,7 +503,6 @@ func detectAnomaly(length, code int) bool {
 	return false
 }
 
-// extractTitle extracts title from HTML
 func extractTitle(body string) string {
 	re := regexp.MustCompile(`(?i)<title[^>]*>([^<]+)</title>`)
 	matches := re.FindStringSubmatch(body)
@@ -530,21 +512,24 @@ func extractTitle(body string) string {
 	return ""
 }
 
-// shouldDisplay checks if result should be displayed
 func shouldDisplay(result Result, matchRe, filterRe *regexp.Regexp) bool {
 	if result.StatusCode == 0 {
 		return false
 	}
 
-	// Status code filters
+	// Default: If no filters/matchers specified, show everything except 404
+	if len(config.MatchCodes) == 0 && len(config.FilterCodes) == 0 && len(config.MatchLen) == 0 {
+		if result.StatusCode == 404 {
+			return false
+		}
+	}
+
 	if len(config.MatchCodes) > 0 && !intContains(config.MatchCodes, result.StatusCode) {
 		return false
 	}
 	if len(config.FilterCodes) > 0 && intContains(config.FilterCodes, result.StatusCode) {
 		return false
 	}
-
-	// Length filters
 	if len(config.MatchLen) > 0 && !intContains(config.MatchLen, result.Length) {
 		return false
 	}
@@ -555,10 +540,8 @@ func shouldDisplay(result Result, matchRe, filterRe *regexp.Regexp) bool {
 	return true
 }
 
-// resultCollector collects results
-func resultCollector(ctx context.Context, wg *sync.WaitGroup, jobResults <-chan Result) {
+func resultCollector(wg *sync.WaitGroup, jobResults <-chan Result) {
 	defer wg.Done()
-
 	for res := range jobResults {
 		resultsLock.Lock()
 		results = append(results, res)
@@ -567,7 +550,6 @@ func resultCollector(ctx context.Context, wg *sync.WaitGroup, jobResults <-chan 
 	}
 }
 
-// printResult prints a result
 func printResult(result Result) {
 	if config.Silent {
 		fmt.Println(result.URL)
@@ -581,48 +563,36 @@ func printResult(result Result) {
 	}
 
 	if config.Colors {
-		fmt.Printf("[%s%3d%s] [%sLen: %8d%s] [%sL: %4d%s] [%sW: %6d%s] [%s%.3fs%s]%s %s%-50s%s",
+		fmt.Printf("[%s%3d%s] [%sLen: %8d%s] [%sL: %4d%s] [%sW: %6d%s] [%s%.3fs%s]%s %s%-40s%s",
 			statusColor, result.StatusCode, ColorReset,
 			ColorCyan, result.Length, ColorReset,
 			ColorBlue, result.Lines, ColorReset,
 			ColorBlue, result.Words, ColorReset,
 			ColorYellow, result.Time, ColorReset,
 			anomalyMarker,
-			ColorGreen+ColorBold, truncate(result.Word, 50), ColorReset)
+			ColorGreen+ColorBold, truncate(result.Word, 40), ColorReset)
 
 		if result.Title != "" {
-			fmt.Printf(" | %s%s%s", ColorPurple, truncate(result.Title, 40), ColorReset)
-		}
-		if result.ContentType != "" {
-			fmt.Printf(" | %s%s%s", ColorDim, truncate(result.ContentType, 30), ColorReset)
+			fmt.Printf(" | %s%s%s", ColorPurple, truncate(result.Title, 30), ColorReset)
 		}
 		fmt.Println()
 	} else {
 		fmt.Printf("[%d] [Len: %d] [L: %d] [W: %d] [%.3fs] %s\n",
-			result.StatusCode, result.Length, result.Lines, result.Words, result.Time, result.Word)
+			result.StatusCode, result.Length, result.Lines, result.Words, result.Time, result.URL)
 	}
 }
 
-// getStatusColor returns color for status code
 func getStatusColor(code int) string {
-	if !config.Colors {
-		return ""
-	}
+	if !config.Colors { return "" }
 	switch {
-	case code >= 200 && code < 300:
-		return ColorGreen + ColorBold
-	case code >= 300 && code < 400:
-		return ColorYellow + ColorBold
-	case code >= 400 && code < 500:
-		return ColorRed
-	case code >= 500:
-		return ColorPurple + ColorBold
-	default:
-		return ColorWhite
+	case code >= 200 && code < 300: return ColorGreen + ColorBold
+	case code >= 300 && code < 400: return ColorYellow + ColorBold
+	case code >= 400 && code < 500: return ColorRed
+	case code >= 500: return ColorPurple + ColorBold
+	default: return ColorWhite
 	}
 }
 
-// truncate truncates string to max length
 func truncate(s string, maxLen int) string {
 	if len(s) > maxLen {
 		return s[:maxLen-3] + "..."
@@ -630,10 +600,8 @@ func truncate(s string, maxLen int) string {
 	return s
 }
 
-// statsPrinter prints live statistics
 func statsPrinter(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
-
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -642,37 +610,37 @@ func statsPrinter(ctx context.Context, wg *sync.WaitGroup) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if config.Silent {
-				continue
-			}
+			if config.Silent { continue }
 			elapsed := time.Since(stats.StartTime)
 			if elapsed.Seconds() > 0 {
 				reqPerSec := float64(stats.Requests) / elapsed.Seconds()
 				fmt.Fprintf(os.Stderr, "%s[%s] Req: %d | Matches: %d | Errors: %d | Rate: %.0f/s%s\r",
-					ColorDim, time.Now().Format("15:04:05"), stats.Requests, stats.Matches, stats.Errors, reqPerSec, ColorReset)
+					ColorDim, time.Now().Format("15:04:05"), 
+					atomic.LoadInt64(&stats.Requests), 
+					atomic.LoadInt64(&stats.Matches), 
+					atomic.LoadInt64(&stats.Errors), 
+					reqPerSec, ColorReset)
 			}
 		}
 	}
 }
 
-// printFinalStats prints final statistics
 func printFinalStats() {
 	fmt.Printf("\n\n%s╔════════════════════════════════════════════════════════════╗%s\n", ColorBold+ColorCyan, ColorReset)
-	fmt.Printf("%s║               ✓ FUZZING COMPLETED SUCCESSFULLY             ║%s\n", ColorBold+ColorCyan, ColorReset)
+	fmt.Printf("%s║                  FUZZING COMPLETED                         ║%s\n", ColorBold+ColorCyan, ColorReset)
 	fmt.Printf("%s╚════════════════════════════════════════════════════════════╝%s\n\n", ColorBold+ColorCyan, ColorReset)
 
 	elapsed := time.Since(stats.StartTime)
 	reqPerSec := float64(stats.Requests) / elapsed.Seconds()
 
 	fmt.Printf("%s[Statistics]%s\n", ColorBold+ColorYellow, ColorReset)
-	fmt.Printf("  %-25s: %s%d%s\n", "Total Requests", ColorGreen, stats.Requests, ColorReset)
-	fmt.Printf("  %-25s: %s%d%s\n", "Matches Found", ColorGreen+ColorBold, stats.Matches, ColorReset)
-	fmt.Printf("  %-25s: %s%d%s\n", "Errors", ColorRed, stats.Errors, ColorReset)
-	fmt.Printf("  %-25s: %s%v%s\n", "Time Elapsed", ColorCyan, elapsed.Round(time.Millisecond), ColorReset)
-	fmt.Printf("  %-25s: %s%.2f%s req/s\n", "Request Rate", ColorGreen+ColorBold, reqPerSec, ColorReset)
+	fmt.Printf("  Total Requests: %s%d%s\n", ColorGreen, stats.Requests, ColorReset)
+	fmt.Printf("  Matches Found : %s%d%s\n", ColorGreen+ColorBold, stats.Matches, ColorReset)
+	fmt.Printf("  Errors        : %s%d%s\n", ColorRed, stats.Errors, ColorReset)
+	fmt.Printf("  Time Elapsed  : %s%v%s\n", ColorCyan, elapsed.Round(time.Millisecond), ColorReset)
+	fmt.Printf("  Avg Speed     : %s%.2f%s req/s\n", ColorGreen+ColorBold, reqPerSec, ColorReset)
 
-	// Print status code summary
-	fmt.Printf("\n%s[Status Codes Summary]%s\n", ColorBold+ColorYellow, ColorReset)
+	fmt.Printf("\n%s[Status Codes]%s\n", ColorBold+ColorYellow, ColorReset)
 	
 	stats.Lock.RLock()
 	var codes []int
@@ -683,275 +651,155 @@ func printFinalStats() {
 	
 	sort.Ints(codes)
 	for _, code := range codes {
+		stats.Lock.RLock()
 		count := stats.StatusCodes[code]
-		color := getStatusColor(code)
-		fmt.Printf("  %s[%d]%s: %d results\n", color, code, ColorReset, count)
+		stats.Lock.RUnlock()
+		fmt.Printf("  %s[%d]%s: %d\n", getStatusColor(code), code, ColorReset, count)
 	}
-
 	fmt.Println()
 }
 
-// printBanner prints animated banner
+// printBanner displays the tool banner with your custom ASCII art
 func printBanner() {
-	frames := []string{
-		fmt.Sprintf("%s╦═╗╔═╗╦ ╦%s", ColorCyan+ColorBold, ColorReset),
-		fmt.Sprintf("%s╠╦╝╠═╣╚╦╝%s", ColorGreen+ColorBold, ColorReset),
-		fmt.Sprintf("%s╩╚═╩ ╩ ╩%s", ColorYellow+ColorBold, ColorReset),
+	banner := `
+██████╗  █████╗ ██╗   ██╗
+██╔══██╗██╔══██╗╚██╗ ██╔╝
+██████╔╝███████║ ╚████╔╝ 
+██╔══██╗██╔══██║  ╚██╔╝  
+██║  ██║██║  ██║   ██║   
+╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝   `
+	
+	if config.Colors {
+		fmt.Println(ColorCyan + ColorBold + banner + ColorReset)
+		fmt.Printf("%s  High-Performance Security Scanner%s\n", ColorGreen, ColorReset)
+		fmt.Printf("%s  Developed by Biswajeet Ray%s\n\n", ColorDim, ColorReset)
+	} else {
+		fmt.Println(banner)
+		fmt.Println("  High-Performance Security Scanner")
+		fmt.Println("  Developed by Biswajeet Ray\n")
 	}
-
-	for _, frame := range frames {
-		fmt.Println(frame)
-	}
-
-	banner := fmt.Sprintf(`%s  🚀 World's Best Web Fuzzer
-  High-Performance Security Scanner
-  Developed by Biswajeet Ray
-  %s%s`,
-		ColorPurple+ColorBold,
-		time.Now().Format("2006-01-02 15:04:05"),
-		ColorReset)
-
-	fmt.Println(banner)
-	fmt.Printf("%s▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓%s\n\n", ColorGreen, ColorReset)
 }
 
-// printConfig prints configuration
-func printConfig(words []string, targets []string) {
-	fmt.Printf("%s[Configuration]%s\n", ColorBold+ColorYellow, ColorReset)
-	fmt.Printf("  %-25s: %d words\n", "Wordlist", len(words))
-	fmt.Printf("  %-25s: %d targets\n", "Targets", len(targets))
-	fmt.Printf("  %-25s: %s\n", "Method", config.Method)
-	fmt.Printf("  %-25s: %d workers\n", "Concurrency", config.Concurrency)
-	fmt.Printf("  %-25s: %ds\n", "Timeout", config.Timeout)
-	if config.Rate > 0 {
-		fmt.Printf("  %-25s: %d req/s\n", "Rate Limit", config.Rate)
-	}
-	if config.AutoCalibrate && config.FuzzMode != ModeDomainScan {
-		fmt.Printf("  %-25s: %s\n", "Auto-Calibrate", "ENABLED")
-	}
-	fmt.Printf("\n%s[Starting Scan]%s\n\n", ColorBold+ColorGreen, ColorReset)
+func printConfig(wordCount, targetCount int) {
+	fmt.Printf("%s[Config]%s\n", ColorBold+ColorYellow, ColorReset)
+	fmt.Printf("  Targets: %d | Words: %d | Threads: %d\n", targetCount, wordCount, config.Concurrency)
+	fmt.Printf("  Method : %s | Timeout: %ds\n", config.Method, config.Timeout)
+	fmt.Printf("\n%s[Starting]%s\n\n", ColorBold+ColorGreen, ColorReset)
 }
 
-// parseFlags parses command-line arguments
 func parseFlags() {
 	flag.StringVar(&config.URL, "u", "", "Target URL with FUZZ placeholder")
 	flag.StringVar(&config.Wordlist, "w", "", "Wordlist file")
 	flag.StringVar(&config.DomainList, "L", "", "List of domains to fuzz")
-	flag.StringVar(&config.DomainScan, "scan", "", "List of domains to scan")
+	flag.StringVar(&config.DomainScan, "scan", "", "List of domains to check alive")
 	flag.StringVar(&config.Method, "X", "GET", "HTTP method")
 	flag.StringVar(&config.Data, "d", "", "POST data")
 	flag.IntVar(&config.Timeout, "timeout", 10, "Timeout in seconds")
-	flag.IntVar(&config.Concurrency, "c", 100, "Concurrency level")
+	flag.IntVar(&config.Concurrency, "c", 50, "Concurrency level")
 	flag.IntVar(&config.Rate, "rate", 0, "Rate limit (req/s)")
 	flag.IntVar(&config.Delay, "delay", 0, "Delay per request (ms)")
-	flag.IntVar(&config.MaxRetries, "retries", 2, "Max retries")
 	flag.BoolVar(&config.Silent, "silent", false, "Silent mode")
 	flag.BoolVar(&config.Colors, "colors", true, "Colorized output")
 	flag.BoolVar(&config.AutoCalibrate, "calibrate", false, "Auto-calibrate baseline")
-	flag.BoolVar(&config.Verbose, "v", false, "Verbose mode")
-	flag.StringVar(&config.Output, "o", "", "Output file")
+	flag.StringVar(&config.Output, "o", "", "Output file (txt)")
 	flag.StringVar(&config.SaveJson, "json", "", "Save as JSON")
 
-	var mc, fc, ml, fl, headers string
-	flag.StringVar(&mc, "mc", "", "Match status codes (200,201)")
-	flag.StringVar(&fc, "fc", "", "Filter status codes (404,403)")
+	flag.Var(&config.Headers, "H", "Custom headers (e.g. -H 'Cookie: 1' -H 'Auth: 2')")
+
+	var mc, fc, ml, fl string
+	flag.StringVar(&mc, "mc", "", "Match status codes (comma-separated)")
+	flag.StringVar(&fc, "fc", "", "Filter status codes")
 	flag.StringVar(&ml, "ml", "", "Match length")
 	flag.StringVar(&fl, "fl", "", "Filter length")
-	flag.StringVar(&config.MatchRegex, "mr", "", "Match regex")
-	flag.StringVar(&config.FilterRegex, "fr", "", "Filter regex")
-	flag.StringVar(&headers, "H", "", "Custom headers (Key:Value,Key:Value)")
-
+	flag.StringVar(&config.MatchRegex, "mr", "", "Match regex pattern")
+	flag.StringVar(&config.FilterRegex, "fr", "", "Filter regex pattern")
+	
 	flag.Parse()
 
-	// Parse headers
-	config.Headers = make(map[string]string)
-	if headers != "" {
-		for _, h := range strings.Split(headers, ",") {
-			parts := strings.SplitN(h, ":", 2)
-			if len(parts) == 2 {
-				config.Headers[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
-			}
-		}
-	}
+	if mc != "" { config.MatchCodes = parseIntList(mc) }
+	if fc != "" { config.FilterCodes = parseIntList(fc) }
+	if ml != "" { config.MatchLen = parseIntList(ml) }
+	if fl != "" { config.FilterLen = parseIntList(fl) }
 
-	// Parse integer lists
-	if mc != "" {
-		config.MatchCodes = parseIntList(mc)
-	}
-	if fc != "" {
-		config.FilterCodes = parseIntList(fc)
-	}
-	if ml != "" {
-		config.MatchLen = parseIntList(ml)
-	}
-	if fl != "" {
-		config.FilterLen = parseIntList(fl)
-	}
-
-	// Determine fuzz mode
-	if config.URL != "" {
-		config.FuzzMode = ModeSingleURL
-	} else if config.DomainList != "" {
-		config.FuzzMode = ModeDomainList
-	} else if config.DomainScan != "" {
-		config.FuzzMode = ModeDomainScan
-	}
+	if config.URL != "" { config.FuzzMode = ModeSingleURL }
+	if config.DomainList != "" { config.FuzzMode = ModeDomainList }
+	if config.DomainScan != "" { config.FuzzMode = ModeDomainScan }
 }
 
-// validateConfig validates configuration
 func validateConfig() {
 	if config.URL == "" && config.DomainList == "" && config.DomainScan == "" {
-		fatal("Specify -u (URL), -L (domain list), or -scan (domain scan)")
-	}
-	if config.URL != "" && config.DomainList != "" {
-		fatal("Cannot use both -u and -L")
-	}
-	if config.URL != "" && config.DomainScan != "" {
-		fatal("Cannot use both -u and -scan")
-	}
-	if config.DomainList != "" && config.DomainScan != "" {
-		fatal("Cannot use both -L and -scan")
+		fatal("Missing target! Use -u, -L, or -scan")
 	}
 	if config.Wordlist == "" && config.FuzzMode != ModeDomainScan {
-		fatal("Wordlist (-w) is required for fuzzing")
+		fatal("Wordlist (-w) is required")
 	}
-	if config.URL != "" && !strings.Contains(config.URL, "FUZZ") {
-		fatal("URL must contain FUZZ placeholder")
-	}
-	if config.Concurrency < 1 {
-		config.Concurrency = 1
-	}
-	if config.Concurrency > 2000 {
-		config.Concurrency = 2000
+	if config.URL != "" && !strings.Contains(config.URL, "FUZZ") && !strings.Contains(config.Data, "FUZZ") {
+		fatal("URL or Data must contain 'FUZZ'")
 	}
 }
 
-// loadWordlist loads words from file
 func loadWordlist(path string) ([]string, error) {
 	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
+	if err != nil { return nil, err }
 	defer file.Close()
-
 	var words []string
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		word := strings.TrimSpace(scanner.Text())
-		if word != "" && !strings.HasPrefix(word, "#") {
-			words = append(words, word)
-		}
+		w := strings.TrimSpace(scanner.Text())
+		if w != "" && !strings.HasPrefix(w, "#") { words = append(words, w) }
 	}
 	return words, scanner.Err()
 }
 
-// loadDomainList loads domains from file
 func loadDomainList(path string) ([]string, error) {
 	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
+	if err != nil { return nil, err }
 	defer file.Close()
-
 	var domains []string
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		domain := strings.TrimSpace(scanner.Text())
-		if domain != "" && !strings.HasPrefix(domain, "#") {
-			// For fuzzing mode, ensure FUZZ placeholder
-			if config.FuzzMode == ModeDomainList {
-				if !strings.Contains(domain, "FUZZ") {
-					domain = strings.TrimRight(domain, "/") + "/FUZZ"
-				}
+		d := strings.TrimSpace(scanner.Text())
+		if d != "" {
+			if config.FuzzMode == ModeDomainList && !strings.Contains(d, "FUZZ") {
+				d = strings.TrimRight(d, "/") + "/FUZZ"
 			}
-			domains = append(domains, domain)
+			domains = append(domains, d)
 		}
 	}
 	return domains, scanner.Err()
 }
 
-// Helper functions
 func parseIntList(s string) []int {
-	var result []int
-	for _, part := range strings.Split(s, ",") {
-		if num, err := strconv.Atoi(strings.TrimSpace(part)); err == nil {
-			result = append(result, num)
-		}
+	var res []int
+	for _, p := range strings.Split(s, ",") {
+		if n, err := strconv.Atoi(strings.TrimSpace(p)); err == nil { res = append(res, n) }
 	}
-	return result
+	return res
 }
 
-func intContains(slice []int, val int) bool {
-	for _, item := range slice {
-		if item == val {
-			return true
-		}
-	}
+func intContains(s []int, v int) bool {
+	for _, i := range s { if i == v { return true } }
 	return false
 }
 
-// saveResults saves results as JSON
 func saveResults() {
-	resultsLock.Lock()
-	defer resultsLock.Unlock()
-
 	file, err := os.Create(config.SaveJson)
-	if err != nil {
-		return
-	}
+	if err != nil { return }
 	defer file.Close()
-
-	// Sort by status code
-	sort.Slice(results, func(i, j int) bool {
-		if results[i].StatusCode != results[j].StatusCode {
-			return results[i].StatusCode < results[j].StatusCode
-		}
-		return results[i].Length > results[j].Length
-	})
-
-	encoder := json.NewEncoder(file)
-	encoder.SetIndent("", "  ")
-	encoder.Encode(results)
-
-	if !config.Silent {
-		fmt.Printf("%s[+] Results saved to %s (%d matches)%s\n", ColorGreen, config.SaveJson, len(results), ColorReset)
-	}
+	enc := json.NewEncoder(file)
+	enc.SetIndent("", "  ")
+	enc.Encode(results)
 }
 
-// saveOutput saves results as text
 func saveOutput() {
-	resultsLock.Lock()
-	defer resultsLock.Unlock()
-
 	file, err := os.Create(config.Output)
-	if err != nil {
-		return
-	}
+	if err != nil { return }
 	defer file.Close()
-
-	// Sort by status code
-	sort.Slice(results, func(i, j int) bool {
-		if results[i].StatusCode != results[j].StatusCode {
-			return results[i].StatusCode < results[j].StatusCode
-		}
-		return results[i].URL < results[j].URL
-	})
-
 	for _, r := range results {
-		line := fmt.Sprintf("[%d] %s (Len: %d, Lines: %d, Words: %d, Time: %.3fs)\n",
-			r.StatusCode, r.URL, r.Length, r.Lines, r.Words, r.Time)
-		file.WriteString(line)
-		if r.Title != "" {
-			file.WriteString(fmt.Sprintf("    Title: %s\n", r.Title))
-		}
-	}
-
-	if !config.Silent {
-		fmt.Printf("%s[+] Output saved to %s (%d matches)%s\n", ColorGreen, config.Output, len(results), ColorReset)
+		file.WriteString(fmt.Sprintf("[%d] %s | Len:%d\n", r.StatusCode, r.URL, r.Length))
 	}
 }
 
-// fatal prints error and exits
 func fatal(msg string) {
 	fmt.Fprintf(os.Stderr, "%s[ERROR]%s %s\n", ColorRed+ColorBold, ColorReset, msg)
 	os.Exit(1)
